@@ -7,13 +7,16 @@ Dépôt de cours et d'expérimentations autour de **n8n** et des agents IA : des
 | Workflow | Description |
 |---|---|
 | [Weekly Slack Digest](./workflows/weekly-slack-digest/) | Chaque vendredi à 19 h (heure de Paris), résume avec Gemini les messages de la semaine du canal Slack #général et envoie la synthèse par Gmail. Gère les nouvelles tentatives et envoie une alerte en cas d'échec. |
+| [RAG Chinese Economy](./workflows/rag-chinese-economy/) | Chatbot RAG qui répond aux questions sur l'économie chinoise à partir d'un livre de référence, en citant les pages. Ingestion par paquets avec reprise, recherche hybride (vecteurs + mots-clés) dans Supabase, reranking et réponse par Gemini, avec historique de conversation. |
 
 Chaque workflow a son propre dossier avec :
 - un fichier `.json` à importer dans n8n (**Workflows → Import from File**) ;
 - un fichier `.workflow.ts` au format [n8n Workflow SDK](https://www.npmjs.com/package/@n8n/workflow-sdk), utilisable avec [`n8ncli`](https://www.npmjs.com/package/@workflows-accelerator/n8n-cli) ;
 - un `README.md` qui explique le fonctionnement et l'installation.
 
-Les exports ne contiennent aucun identifiant ni aucune donnée personnelle : il faut connecter ses propres comptes (Slack, Gemini, Gmail…) après l'import.
+Certains workflows ajoutent les fichiers dont ils ont besoin, par exemple un script SQL Supabase et une page de chat pour **RAG Chinese Economy**.
+
+Les exports ne contiennent aucun identifiant ni aucune donnée personnelle : il faut connecter ses propres comptes (Slack, Gemini, Gmail, Supabase…) après l'import.
 
 ## Skills Claude Code
 
@@ -34,5 +37,6 @@ Pour utiliser un skill, copie son dossier dans `~/.claude/skills/` (tous tes pro
 │   ├── hostile-review/
 │   └── interview/
 └── workflows/
+    ├── rag-chinese-economy/
     └── weekly-slack-digest/
 ```
