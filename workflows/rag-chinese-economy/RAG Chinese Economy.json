@@ -1,0 +1,1451 @@
+{
+  "name": "RAG Chinese Economy",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "Chinese Economy Book - Ingestion",
+        "formDescription": "Upload the PDF of the reference book on the Chinese economy (a text PDF, not a scan). Running it again resumes the ingestion: chunks already stored are skipped.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Book (PDF)",
+              "fieldType": "file",
+              "fieldName": "book",
+              "multipleFiles": false,
+              "acceptFileTypes": ".pdf",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        64,
+        -560
+      ],
+      "id": "6b7a6b13-49ed-4fac-8bd1-5c322c81613d",
+      "name": "PDF Form"
+    },
+    {
+      "parameters": {
+        "public": true,
+        "mode": "webhook",
+        "options": {
+          "allowedOrigins": "*",
+          "responseMode": "lastNode"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.5,
+      "position": [
+        64,
+        256
+      ],
+      "id": "ea38f958-e3dc-4505-a767-29f8e361f552",
+      "name": "When Chat Message Received"
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "book",
+        "options": {
+          "joinPages": false
+        }
+      },
+      "id": "2f514877-989a-4a88-9676-a1e89ed54d7d",
+      "name": "Extract",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        288,
+        -560
+      ],
+      "notes": "Extracts the text of the book page by page so that every chunk keeps its page number."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "error-output",
+              "name": "output",
+              "value": "Désolé, le service est momentanément indisponible, merci de réessayer plus tard. / Sorry, the service is temporarily unavailable, please try again later.",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "f652d63d-9e9e-4e79-a605-c3ad48fd124b",
+      "name": "Service Unavailable Reply",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        3760,
+        800
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite-preview",
+        "options": {
+          "maxOutputTokens": 1024,
+          "temperature": 0.2
+        }
+      },
+      "id": "2e6e8ea7-993a-4371-bbce-7da8c3ce607e",
+      "name": "Gemini Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        3456,
+        480
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "reply-output",
+              "name": "output",
+              "value": "={{ $('Generation').first().json.text }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "c48b5ed6-6e13-417d-b98d-d5a35b695f8a",
+      "name": "Format Reply",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        3984,
+        256
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "clean-pages",
+              "name": "pages",
+              "value": "={{ [].concat($json.text ?? []).map(page => String(page ?? '').replace(/\\uFFFD/g, \"'\").replace(/[\\u007B\\u007D]/g, '').replace(/[ \\t]+/g, ' ').replace(/\\n\\n\\n+/g, '\\n\\n').trim()) }}",
+              "type": "array"
+            },
+            {
+              "id": "book-source",
+              "name": "source",
+              "value": "={{ $json.info?.Title ? $json.info.Title.concat($json.info.Author ? ' ('.concat($json.info.Author, ')') : '') : ($('PDF Form').first().binary?.book?.fileName ?? 'Reference book').replace(/\\.pdf$/i, '').replace(/_+/g, ' ').trim() }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "16edd86e-25d9-4b9b-89bc-960606421096",
+      "name": "Cleaning",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        592,
+        -560
+      ],
+      "notes": "Normalizes the text of every page (spaces, blank lines, undecodable quotes, braces) and builds the book title used in citations."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Split the cleaned book into overlapping chunks and record the pages each chunk covers\nconst CHUNK_SIZE = 2000; // characters per chunk\nconst OVERLAP = 200;     // characters repeated between two consecutive chunks\nconst MIN_LENGTH = 30;   // ignore blank pages and tiny leftovers\n\nconst { pages = [], source } = $input.first().json;\n\n// Concatenate the pages and remember where each one starts in the full text\nlet fullText = '';\nconst pageStarts = [];\npages.forEach((page, index) => {\n  if (page.length < MIN_LENGTH) return;\n  pageStarts.push({ offset: fullText.length, pageNumber: index + 1 });\n  fullText += page + '\\n\\n';\n});\nif (!pageStarts.length) {\n  throw new Error('No extractable text in this PDF (scanned or image-only file?). Nothing was stored.');\n}\nconst pageAt = (offset) => {\n  let pageNumber = pageStarts[0].pageNumber;\n  for (const start of pageStarts) {\n    if (start.offset > offset) break;\n    pageNumber = start.pageNumber;\n  }\n  return pageNumber;\n};\n\nconst chunks = [];\nlet start = 0;\nwhile (start < fullText.length) {\n  let end = Math.min(start + CHUNK_SIZE, fullText.length);\n  if (end < fullText.length) {\n    // Prefer to cut at a paragraph, then a sentence, then a word boundary\n    const window = fullText.slice(start, end);\n    const cut = [window.lastIndexOf('\\n\\n'), window.lastIndexOf('. '), window.lastIndexOf(' ')]\n      .find((position) => position > CHUNK_SIZE / 2);\n    if (cut !== undefined) end = start + cut + 1;\n  }\n  const content = fullText.slice(start, end).trim();\n  if (content.length >= MIN_LENGTH) {\n    const firstPage = pageAt(start);\n    const lastPage = pageAt(end - 1);\n    chunks.push({\n      json: {\n        content,\n        metadata: { source, pageNumber: firstPage === lastPage ? firstPage : `${firstPage}-${lastPage}`, chunkIndex: chunks.length },\n      },\n    });\n  }\n  if (end >= fullText.length) break;\n  start = end - OVERLAP;\n  const space = fullText.indexOf(' ', start); // do not start in the middle of a word\n  if (space !== -1 && space < end) start = space + 1;\n}\nreturn chunks;"
+      },
+      "id": "9cd6bdb2-a3df-4fa9-9755-b88cba5f82bf",
+      "name": "Chunking",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        -560
+      ],
+      "notes": "Cuts the book into chunks of about 2000 characters with 200 characters of overlap, each tagged with its source and page range. Stops if the PDF has no text."
+    },
+    {
+      "parameters": {
+        "maxItems": 1000
+      },
+      "id": "18f9ca71-39f0-4f5a-a737-e63ef7466283",
+      "name": "Limit",
+      "type": "n8n-nodes-base.limit",
+      "typeVersion": 1,
+      "position": [
+        1120,
+        -560
+      ],
+      "notes": "Test value: only the first 3 chunks are embedded. Set it to 1000 to ingest the whole book."
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_WORKFLOW_ID"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "1e2f5935-5fa4-4192-916a-9de061d615dc",
+      "name": "Chunking (SUB)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.4,
+      "position": [
+        2208,
+        -528
+      ],
+      "notes": "Sends all the chunks to the sub-workflow below (Chunking (Trigger)) in a single call."
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "a05c78af-877c-408b-987a-420a581191d3",
+      "name": "Chunking (Trigger)",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        1952,
+        -224
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googlePalmApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"content\": {\n    \"parts\": [\n      {\n        \"text\": {{ JSON.stringify($json.content) }}\n      }\n    ]\n  }\n}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1300
+            }
+          }
+        }
+      },
+      "id": "5e5cdecf-0ea2-4705-8db2-6c3bba0c24ad",
+      "name": "Embedding",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2176,
+        -224
+      ],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "notes": "Gemini gemini-embedding-001 turns each chunk into a 3072-dimension vector. One request every 1.3 s to stay under the free quota.",
+      "credentials": {
+        "googlePalmApi": {
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "insert into public.documents (content, metadata, embedding)\nvalues ($1, $2::jsonb, $3::extensions.vector)\non conflict do nothing;",
+        "options": {
+          "queryReplacement": "={{ [ $('Chunking (Trigger)').item.json.content, JSON.stringify($('Chunking (Trigger)').item.json.metadata), JSON.stringify($json.embedding.values) ] }}"
+        }
+      },
+      "id": "c15e4cc5-f88b-4786-b0ef-5182b9bc797c",
+      "name": "Execute a SQL Query",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2400,
+        -224
+      ],
+      "notes": "Stores the chunk, its metadata and its vector in the Supabase documents table. Values are passed as an array so that commas in the text are not split.",
+      "credentials": {
+        "postgres": {
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select coalesce(json_agg((metadata->>'chunkIndex')::int), '[]'::json) as stored\nfrom public.documents\nwhere metadata->>'source' = $1;",
+        "options": {
+          "queryReplacement": "={{ [ $json.metadata.source ] }}"
+        }
+      },
+      "id": "30d5c904-d22b-47a6-9319-2520ce8914aa",
+      "name": "Find Stored Chunks",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        1424,
+        -560
+      ],
+      "executeOnce": true,
+      "notes": "Lists the chunk numbers of this book already in the knowledge base, so a relaunch resumes where it stopped.",
+      "credentials": {
+        "postgres": {
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Skip the chunks already stored by a previous run: no duplicate rows and no wasted Gemini quota\nconst stored = new Set(($input.first().json.stored ?? []).map(Number));\nreturn $('Limit').all().filter((chunk) => !stored.has(chunk.json.metadata.chunkIndex));"
+      },
+      "id": "18f84bbb-5a8e-42bd-93e1-21d7aa43e455",
+      "name": "Keep Missing Chunks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1648,
+        -560
+      ],
+      "notes": "Keeps only the chunks that are not in the knowledge base yet."
+    },
+    {
+      "parameters": {},
+      "id": "6a46579b-6839-466e-9a4a-722628c595a6",
+      "name": "Ingestion Complete",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2208,
+        -656
+      ],
+      "notes": "Reached when every batch has been stored. A green execution in the Executions list means the whole book is in the knowledge base."
+    },
+    {
+      "parameters": {
+        "batchSize": 25,
+        "options": {}
+      },
+      "id": "1cd06d5c-1610-4ff3-9e70-19ba5dc2ef2e",
+      "name": "Loop Over Items",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1952,
+        -560
+      ],
+      "notes": "Sends the chunks to the sub-workflow 25 at a time; each batch is stored before the next one starts."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "cfg-max-queries",
+              "name": "maxQueries",
+              "value": 3,
+              "type": "number"
+            },
+            {
+              "id": "cfg-match-count",
+              "name": "matchCount",
+              "value": 8,
+              "type": "number"
+            },
+            {
+              "id": "cfg-candidate-count",
+              "name": "candidateCount",
+              "value": 15,
+              "type": "number"
+            },
+            {
+              "id": "cfg-keep-count",
+              "name": "keepCount",
+              "value": 5,
+              "type": "number"
+            },
+            {
+              "id": "cfg-min-score",
+              "name": "minRerankScore",
+              "value": 5,
+              "type": "number"
+            },
+            {
+              "id": "cfg-history",
+              "name": "historyExchanges",
+              "value": 5,
+              "type": "number"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "2461bcae-daa9-440f-ba57-65a0a919f759",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        368,
+        256
+      ],
+      "notes": "Settings of the answering pipeline: queries per question, results per query, candidates sent to reranking, passages kept, minimum relevance, exchanges of history."
+    },
+    {
+      "parameters": {
+        "options": {
+          "groupMessages": true
+        }
+      },
+      "id": "5252d303-046c-403e-96bd-15e4a1caeb4f",
+      "name": "Load Messages",
+      "type": "@n8n/n8n-nodes-langchain.memoryManager",
+      "typeVersion": 1.1,
+      "position": [
+        592,
+        256
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueErrorOutput",
+      "notes": "Reads the last exchanges of this chat session from Supabase (table n8n_chat_histories)."
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('When Chat Message Received').first().json.sessionId }}"
+      },
+      "id": "735d22ec-435a-44fe-8e56-fc64e0418890",
+      "name": "Load Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
+      "typeVersion": 1.4,
+      "position": [
+        608,
+        480
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Gather the question, the recent conversation and the settings used by the next steps\nconst config = $('Config').first().json;\nconst strip = (text) => String(text ?? '').replace(/[{}]/g, '').trim(); // braces break LangChain prompt templates\n\nconst lines = [];\nfor (const item of $input.all()) {\n  const messages = Array.isArray(item.json.messages) ? item.json.messages : [item.json];\n  for (const message of messages) {\n    if (message.human) lines.push(`User: ${strip(message.human)}`);\n    if (message.ai) lines.push(`Assistant: ${strip(message.ai)}`);\n    const role = message.type ?? message.role;\n    const text = message.content ?? message.text ?? message.data?.content ?? message.kwargs?.content;\n    if (!message.human && !message.ai && role && text) {\n      lines.push(`${/ai|assistant/i.test(role) ? 'Assistant' : 'User'}: ${strip(text)}`);\n    }\n  }\n}\n\nreturn [{\n  json: {\n    question: strip(config.chatInput),\n    history: lines.slice(-2 * config.historyExchanges).join('\\n') || 'No previous messages.',\n    config,\n  },\n}];"
+      },
+      "id": "0f7cbecb-dc6c-4733-9c31-79bcaef80245",
+      "name": "Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        848,
+        256
+      ],
+      "notes": "Builds the context of the turn: the user message, the recent conversation as text, and the settings."
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Conversation so far:\n{{ $json.history }}\n\nNew user message:\n{{ $json.question }}",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You are the query router of a question answering assistant about the Chinese economy. Its only knowledge source is a reference book written in English.\n\nAnalyse the new user message with the conversation and fill these fields:\n- route: \"direct\" only when the message needs no content from the book: greetings, thanks, small talk, or a request about the previous answers (rephrase, shorten, translate). Every question about economics, China, politics, figures or the book is \"search\". When in doubt, choose \"search\".\n- standaloneQuestion: the user message rewritten as a self-contained question, using the conversation to resolve references such as \"it\" or \"and for the property sector?\". Keep the language of the user.\n- queries: 1 to 3 short search queries written in English, each covering a different aspect of the question. Empty list when route is \"direct\".\n- keywords: 2 to 6 precise English terms likely to appear word for word in the book: names of people, companies, institutions, acronyms, technical terms. Empty list when route is \"direct\"."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "id": "47a2a235-e3c0-42c8-9f18-090b553998b7",
+      "name": "Routing",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        1152,
+        256
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-flash-lite",
+        "options": {
+          "maxOutputTokens": 512,
+          "temperature": 0
+        }
+      },
+      "id": "5fbf11b2-0862-410f-9ee2-5a20e5a27e7f",
+      "name": "Gemini Routing Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        1104,
+        480
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"route\": { \"type\": \"string\", \"enum\": [\"search\", \"direct\"] },\n    \"standaloneQuestion\": { \"type\": \"string\" },\n    \"queries\": { \"type\": \"array\", \"items\": { \"type\": \"string\" }, \"maxItems\": 3 },\n    \"keywords\": { \"type\": \"array\", \"items\": { \"type\": \"string\" }, \"maxItems\": 6 }\n  },\n  \"required\": [\"route\", \"standaloneQuestion\", \"queries\", \"keywords\"]\n}"
+      },
+      "id": "ee5aec95-7bcc-4542-9ad7-1c0ddb7d04dc",
+      "name": "Routing Parser",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        1264,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "route-is-not-direct",
+              "leftValue": "={{ $json.output.route }}",
+              "rightValue": "direct",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "8bd54207-7dda-4856-8a3b-47783a4fff48",
+      "name": "Needs Search",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1488,
+        256
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// One item per search query (at most maxQueries), each carrying the keywords for the full-text part of the search\nconst { config, question } = $('Context').first().json;\nconst routing = $input.first().json.output ?? {};\n\nconst queries = [...new Set((routing.queries ?? []).map((query) => String(query).trim()).filter(Boolean))].slice(0, config.maxQueries);\nif (!queries.length) queries.push(routing.standaloneQuestion || question);\n\n// websearch_to_tsquery syntax: multi-word keywords between quotes, joined with \"or\"\nconst keywords = (routing.keywords ?? [])\n  .map((keyword) => String(keyword).replace(/[\"']/g, '').trim())\n  .filter(Boolean)\n  .map((keyword) => (keyword.includes(' ') ? `\"${keyword}\"` : keyword))\n  .join(' or ');\n\nreturn queries.map((query) => ({ json: { query, keywords } }));"
+      },
+      "id": "0c69c5b5-0ddf-425e-bc62-e44e97aef0e8",
+      "name": "Prepare Queries",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1808,
+        256
+      ],
+      "notes": "Turns the routing output into one item per search query, with the keywords in full-text search syntax."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googlePalmApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"content\": {\n    \"parts\": [\n      {\n        \"text\": {{ JSON.stringify($json.query) }}\n      }\n    ]\n  }\n}",
+        "options": {}
+      },
+      "id": "fb81ca5e-19fb-4275-992d-d58577dc32e0",
+      "name": "Embed Queries",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2032,
+        256
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "notes": "Same model as the ingestion (gemini-embedding-001), so query and chunk vectors are comparable.",
+      "credentials": {
+        "googlePalmApi": {
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select id, content, metadata, similarity, vector_rank, keyword_rank, score\nfrom public.hybrid_search($1::extensions.vector, $2, $3);",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.embedding.values), $('Prepare Queries').item.json.keywords, $('Context').first().json.config.matchCount ] }}"
+        }
+      },
+      "id": "a33ad246-118b-4d9a-a0cf-28209eecf607",
+      "name": "Search",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [
+        2256,
+        256
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueErrorOutput",
+      "notes": "Hybrid search in Supabase: vector similarity plus keyword full-text search, merged by rank (hybrid_search SQL function).",
+      "credentials": {
+        "postgres": {
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge the results of all queries: one entry per chunk with its best score, best candidates first\nconst { config, question } = $('Context').first().json;\nconst routing = $('Routing').first().json.output ?? {};\n\nconst best = new Map();\nfor (const { json: row } of $input.all()) {\n  if (!row.id) continue;\n  const key = String(row.id);\n  if (!best.has(key) || Number(row.score) > Number(best.get(key).score)) best.set(key, row);\n}\n\nconst candidates = [...best.values()]\n  .sort((a, b) => Number(b.score) - Number(a.score))\n  .slice(0, config.candidateCount)\n  .map((row) => ({\n    id: Number(row.id),\n    page: row.metadata?.pageNumber,\n    source: row.metadata?.source,\n    content: String(row.content ?? '').replace(/[{}]/g, ''),\n  }));\n\nconst candidateList = candidates\n  .map((candidate) => `<passage id=\"${candidate.id}\" page=\"${candidate.page}\">\\n${candidate.content}\\n</passage>`)\n  .join('\\n\\n');\n\nreturn [{ json: { question: routing.standaloneQuestion || question, candidates, candidateList: candidateList || 'NO PASSAGE FOUND' } }];"
+      },
+      "id": "279fdef9-fb53-492f-8b5a-03fc89c1f840",
+      "name": "Merge Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2480,
+        256
+      ],
+      "notes": "Deduplicates the passages found by the different queries and keeps the best candidates for reranking."
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Question:\n{{ $json.question }}\n\nCandidate passages:\n{{ $json.candidateList }}",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You rerank passages retrieved from a book about the Chinese economy.\nFor every candidate passage, give a relevance score from 0 to 10 for answering the question: 10 means the passage directly answers it, 5 means it gives useful context, 0 means it is unrelated.\nJudge only the relevance of the content, not its style or length. Return every passage id with its score."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "id": "e2630de8-f595-4f1f-990b-e9f92fa99781",
+      "name": "Reranking",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        2800,
+        256
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite-preview",
+        "options": {
+          "maxOutputTokens": 1024,
+          "temperature": 0
+        }
+      },
+      "id": "fdddc16e-f43c-415e-9158-28402fa19c34",
+      "name": "Gemini Reranking Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        2752,
+        480
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"ranking\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"id\": { \"type\": \"integer\" },\n          \"score\": { \"type\": \"number\", \"minimum\": 0, \"maximum\": 10 }\n        },\n        \"required\": [\"id\", \"score\"]\n      }\n    }\n  },\n  \"required\": [\"ranking\"]\n}"
+      },
+      "id": "86c9a0a5-3a8b-4d9b-aad9-dbfd1339e5ef",
+      "name": "Reranking Parser",
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.3,
+      "position": [
+        2912,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Keep the passages Gemini judged most relevant and format them as cited excerpts for the answer\nconst { config } = $('Context').first().json;\nconst { question, candidates } = $('Merge Results').first().json;\nconst relevance = new Map(($input.first().json.output?.ranking ?? []).map((entry) => [Number(entry.id), Number(entry.score)]));\n\nconst kept = candidates\n  .map((candidate) => ({ ...candidate, relevance: relevance.get(candidate.id) ?? 0 }))\n  .filter((candidate) => candidate.relevance >= config.minRerankScore)\n  .sort((a, b) => b.relevance - a.relevance)\n  .slice(0, config.keepCount);\n\nconst context = kept\n  .map((passage, index) => `<excerpt id=\"${index + 1}\" source=\"${passage.source || 'reference book'}\" page=\"${passage.page || 'unknown'}\">\\n${passage.content}\\n</excerpt>`)\n  .join('\\n\\n');\n\nreturn [{ json: { question, context: context || 'NO RELEVANT EXCERPT FOUND' } }];"
+      },
+      "id": "93bfefc3-fe67-4d27-800d-63f87ddf6d1b",
+      "name": "Keep Best Passages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3136,
+        256
+      ],
+      "notes": "Keeps the passages scored at least minRerankScore by the reranking, best first, at most keepCount."
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Conversation so far:\n{{ $('Context').first().json.history }}\n\nUser message:\n{{ $('Context').first().json.question }}\n\nStandalone question:\n{{ $json.question }}\n\nExcerpts from the reference book:\n{{ $json.context }}",
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You are a research assistant answering questions about the Chinese economy. You answer using ONLY the excerpts of the reference book given in the user message. Each excerpt has a source attribute (book title and author) and a page attribute. The conversation is only there to understand the question.\n\nAbsolute rules:\n1. Never invent anything and never use outside knowledge, even if you know the answer. If the excerpts do not contain the information, say so clearly, for example in French: \"Je n'ai pas cette information dans le livre.\" or in English: \"I don't have this information in the book.\"\n2. Always answer in the language of the user message, even if the excerpts are written in another language.\n3. Structure a good answer as: the requested information first, then useful context found in the excerpts (figures, dates, causes and consequences, comparisons between periods, sectors or countries), then the source as (book title, p. X) using the source and page attributes of the excerpts you used.\n4. Copy every figure, percentage and date exactly as written in the excerpts and never guess a number. When the author gives an opinion or a forecast, present it as the view of the author.\n5. Stay concise: a few sentences or a short list.\n6. When the excerpts say NO SEARCH NEEDED, the message is small talk or about the previous answers: reply briefly from the conversation only, without adding any new fact."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "id": "af9a395e-ecc4-43cd-bea6-53f2b2cdab54",
+      "name": "Generation",
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        3456,
+        256
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "direct-question",
+              "name": "question",
+              "value": "={{ $json.output.standaloneQuestion || $('Context').first().json.question }}",
+              "type": "string"
+            },
+            {
+              "id": "direct-context",
+              "name": "context",
+              "value": "NO SEARCH NEEDED: this message is small talk or about the conversation itself.",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "66de47e0-75b9-4c9b-96ec-11b6ab90bcfb",
+      "name": "Skip Search",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        1488,
+        480
+      ],
+      "notes": "Direct route: no search and no reranking for greetings, thanks or requests about previous answers."
+    },
+    {
+      "parameters": {
+        "mode": "insert",
+        "messages": {
+          "messageValues": [
+            {
+              "type": "user",
+              "message": "={{ $('Context').first().json.question }}"
+            },
+            {
+              "type": "ai",
+              "message": "={{ $json.text }}"
+            }
+          ]
+        }
+      },
+      "id": "926b035c-4f66-4941-bfab-8632f9c7cdd7",
+      "name": "Save Messages",
+      "type": "@n8n/n8n-nodes-langchain.memoryManager",
+      "typeVersion": 1.1,
+      "position": [
+        3744,
+        256
+      ],
+      "onError": "continueRegularOutput",
+      "notes": "Stores the question and the answer in the chat history; the reply is sent even if saving fails."
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{ $('When Chat Message Received').first().json.sessionId }}"
+      },
+      "id": "49fb1557-6082-40a8-a3b6-b186512ba4d4",
+      "name": "Save Memory",
+      "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
+      "typeVersion": 1.4,
+      "position": [
+        3760,
+        480
+      ],
+      "credentials": {
+        "postgres": {
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "id": "49eb2578-a385-4cef-97bd-e7e9aa08995f",
+      "name": "Note Ingestion 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -800
+      ],
+      "parameters": {
+        "content": "## Ingestion\n### 1 · Dépôt & extraction\nLe formulaire reçoit le PDF du livre. **Extract** en sort le texte page par page.",
+        "color": 2,
+        "width": 480,
+        "height": 400
+      }
+    },
+    {
+      "id": "9b5c2133-dbc3-40c5-af61-933adb46eb07",
+      "name": "Note Ingestion 2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        528,
+        -800
+      ],
+      "parameters": {
+        "content": "### 2 · Nettoyage\nNormalise le texte de chaque page et construit le titre du livre utilisé dans les citations.",
+        "color": 2,
+        "width": 256,
+        "height": 400
+      }
+    },
+    {
+      "id": "22024796-f81f-427b-8573-949b61c24caa",
+      "name": "Note Ingestion 3",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        832,
+        -800
+      ],
+      "parameters": {
+        "content": "### 3 · Découpage\n**Chunking** coupe le livre en morceaux d'environ 2 000 caractères (200 de chevauchement), avec leurs pages. **Limit** borne le nombre de chunks pour les tests.",
+        "color": 2,
+        "width": 480,
+        "height": 400
+      }
+    },
+    {
+      "id": "cde36919-9464-4591-8ab8-6759c6d27d2f",
+      "name": "Note Ingestion 4",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1360,
+        -800
+      ],
+      "parameters": {
+        "content": "### 4 · Reprise\nRepère les chunks déjà en base et ne garde que les manquants : une relance reprend là où elle s'est arrêtée, sans doublon.",
+        "color": 2,
+        "width": 480,
+        "height": 400
+      }
+    },
+    {
+      "id": "69d6d560-1cb1-49f2-a63c-25512c2f27c0",
+      "name": "Note Ingestion 5",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1888,
+        -800
+      ],
+      "parameters": {
+        "content": "### 5 · Boucle par paquets de 25\nEnvoie les chunks au sous-workflow 25 par 25. Chaque paquet est enregistré avant le suivant. À la fin : **Ingestion Complete**.",
+        "color": 2,
+        "width": 736,
+        "height": 400
+      }
+    },
+    {
+      "id": "cc1644c0-d80b-49bb-9056-eb2842a26d5d",
+      "name": "Note Ingestion 6",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1888,
+        -384
+      ],
+      "parameters": {
+        "content": "### 6 · Sous-workflow : vectorisation & stockage\nLancé par **Chunking (SUB)**, dans une exécution séparée. **Embedding** vectorise chaque chunk avec Gemini (1 requête / 1,3 s), **Execute a SQL Query** l'insère dans Supabase.",
+        "color": 2,
+        "width": 736,
+        "height": 304
+      }
+    },
+    {
+      "id": "74e4aa1d-d8e2-4f09-b5a0-9f419686b9fd",
+      "name": "Note Answering 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -16,
+        0
+      ],
+      "parameters": {
+        "content": "## Answering\n### 1 · Input (Chat)\nReçoit le message de l'utilisateur et son identifiant de session.",
+        "color": 2,
+        "width": 272,
+        "height": 624
+      }
+    },
+    {
+      "id": "b006ac2d-3862-4270-94e0-63c502e99052",
+      "name": "Note Answering 2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        320,
+        0
+      ],
+      "parameters": {
+        "content": "### 2 · Context\n**Config** : réglages du pipeline. **Load Messages** : les 5 derniers échanges (Supabase). **Context** : question + historique.",
+        "color": 2,
+        "width": 720,
+        "height": 624
+      }
+    },
+    {
+      "id": "3f434091-5699-4f2b-ba42-702744687692",
+      "name": "Note Answering 3",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1072,
+        0
+      ],
+      "parameters": {
+        "content": "### 3 · Routing\nGemini reformule la question et produit 1 à 3 requêtes et des mots-clés en anglais. **Needs Search** : recherche dans le livre, ou **Skip Search** pour une réponse directe (salutations, remerciements).",
+        "color": 2,
+        "width": 560,
+        "height": 624
+      }
+    },
+    {
+      "id": "82ce8b9c-5c90-40c5-9cbd-f8f81d5d045d",
+      "name": "Note Answering 4",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1760,
+        0
+      ],
+      "parameters": {
+        "content": "### 4 · Search\nVectorise chaque requête, puis recherche hybride dans Supabase (vecteurs + mots-clés). **Merge Results** dédoublonne et garde 15 candidats.",
+        "color": 2,
+        "width": 864,
+        "height": 624
+      }
+    },
+    {
+      "id": "9ac10c87-f9b6-4c1b-994b-f83180ce19b4",
+      "name": "Note Answering 5",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2704,
+        0
+      ],
+      "parameters": {
+        "content": "### 5 · Reranking\nGemini Flash Lite note chaque passage de 0 à 10. **Keep Best Passages** garde les 5 meilleurs (au moins 5/10).",
+        "color": 2,
+        "width": 576,
+        "height": 624
+      }
+    },
+    {
+      "id": "055c6669-b566-43a4-97d7-3de937f77d45",
+      "name": "Note Answering 6",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3408,
+        0
+      ],
+      "parameters": {
+        "content": "### 6 · Generation\nGemini rédige la réponse à partir des passages (langue de la question, citations, rien d'inventé), puis l'échange est enregistré dans l'historique.",
+        "color": 2,
+        "width": 720,
+        "height": 624
+      }
+    },
+    {
+      "id": "43f9aa76-73f8-434f-a1fc-70dd87b3ecac",
+      "name": "Note Answering 7",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3408,
+        688
+      ],
+      "parameters": {
+        "content": "### Pannes\nSi Gemini ou Supabase échoue à une étape, l'utilisateur reçoit un message d'excuse.",
+        "color": 2,
+        "width": 720,
+        "height": 288
+      }
+    }
+  ],
+  "connections": {
+    "PDF Form": {
+      "main": [
+        [
+          {
+            "node": "Extract",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract": {
+      "main": [
+        [
+          {
+            "node": "Cleaning",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cleaning": {
+      "main": [
+        [
+          {
+            "node": "Chunking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunking": {
+      "main": [
+        [
+          {
+            "node": "Limit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunking (Trigger)": {
+      "main": [
+        [
+          {
+            "node": "Embedding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embedding": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Limit": {
+      "main": [
+        [
+          {
+            "node": "Find Stored Chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Stored Chunks": {
+      "main": [
+        [
+          {
+            "node": "Keep Missing Chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Keep Missing Chunks": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunking (SUB)": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "Ingestion Complete",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Chunking (SUB)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When Chat Message Received": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Load Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Messages": {
+      "main": [
+        [
+          {
+            "node": "Context",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Service Unavailable Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "Load Messages",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Context": {
+      "main": [
+        [
+          {
+            "node": "Routing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Routing": {
+      "main": [
+        [
+          {
+            "node": "Needs Search",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Service Unavailable Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Routing Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Routing",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Routing Parser": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Routing",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Search": {
+      "main": [
+        [
+          {
+            "node": "Prepare Queries",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Skip Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Queries": {
+      "main": [
+        [
+          {
+            "node": "Embed Queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed Queries": {
+      "main": [
+        [
+          {
+            "node": "Search",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Service Unavailable Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search": {
+      "main": [
+        [
+          {
+            "node": "Merge Results",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Service Unavailable Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Results": {
+      "main": [
+        [
+          {
+            "node": "Reranking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reranking": {
+      "main": [
+        [
+          {
+            "node": "Keep Best Passages",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Service Unavailable Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Reranking Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Reranking",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reranking Parser": {
+      "ai_outputParser": [
+        [
+          {
+            "node": "Reranking",
+            "type": "ai_outputParser",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Keep Best Passages": {
+      "main": [
+        [
+          {
+            "node": "Generation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generation": {
+      "main": [
+        [
+          {
+            "node": "Save Messages",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Service Unavailable Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Generation",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip Search": {
+      "main": [
+        [
+          {
+            "node": "Generation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Messages": {
+      "main": [
+        [
+          {
+            "node": "Format Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "Save Messages",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "pinData": {},
+  "tags": []
+}
